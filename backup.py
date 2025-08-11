@@ -289,6 +289,44 @@ class BackupScript:
                     
             except Exception as e:
                 self.log_warning(f"Error reading wp-config.php: {e}")
+        
+        # Check for LocalSettings.php (MediaWiki)
+        mw_settings = site_path / 'public/LocalSettings.php'
+        if mw_settings.exists():
+            self.log_info("Found LocalSettings.php, extracting database config")
+            try:
+                with open(mw_settings, 'r') as f:
+                    content = f.read()
+
+                import re
+
+                server_match = re.search(r"\$wgDBserver\s*=\s*['\"]([^'\"]+)['\"]", content)
+                if server_match:
+                    server_value = server_match.group(1).strip()
+                    # If server is in host:port format, split accordingly (avoid IPv6 and socket paths)
+                    if server_value.count(':') == 1 and '/' not in server_value:
+                        host_part, port_part = server_value.rsplit(':', 1)
+                        if host_part:
+                            db_config['host'] = host_part
+                        if port_part.isdigit():
+                            db_config['port'] = port_part
+                    else:
+                        db_config['host'] = server_value
+
+                name_match = re.search(r"\$wgDBname\s*=\s*['\"]([^'\"]+)['\"]", content)
+                if name_match:
+                    db_config['name'] = name_match.group(1)
+
+                user_match = re.search(r"\$wgDBuser\s*=\s*['\"]([^'\"]+)['\"]", content)
+                if user_match:
+                    db_config['user'] = user_match.group(1)
+
+                pass_match = re.search(r"\$wgDBpassword\s*=\s*['\"]([^'\"]*)['\"]", content)
+                if pass_match:
+                    db_config['password'] = pass_match.group(1)
+
+            except Exception as e:
+                self.log_warning(f"Error reading LocalSettings.php: {e}")
                 
         # Check for conf_global.php (Invision Power Board)
         conf_global = site_path / 'public/conf_global.php'
@@ -300,21 +338,57 @@ class BackupScript:
                     
                 import re
                 
-                sql_host_match = re.search(r"\$INFO\s*\[\s*['\"]sql_host['\"].*?=\s*['\"]([^'\"]+)['\"]", content)
-                if sql_host_match:
-                    db_config['host'] = sql_host_match.group(1)
-                    
-                sql_db_match = re.search(r"\$INFO\s*\[\s*['\"]sql_database['\"].*?=\s*['\"]([^'\"]+)['\"]", content)
-                if sql_db_match:
-                    db_config['name'] = sql_db_match.group(1)
-                    
-                sql_user_match = re.search(r"\$INFO\s*\[\s*['\"]sql_user['\"].*?=\s*['\"]([^'\"]+)['\"]", content)
-                if sql_user_match:
-                    db_config['user'] = sql_user_match.group(1)
-                    
-                sql_pass_match = re.search(r"\$INFO\s*\[\s*['\"]sql_pass['\"].*?=\s*['\"]([^'\"]+)['\"]", content)
-                if sql_pass_match:
-                    db_config['password'] = sql_pass_match.group(1)
+                # Support both assignment syntax ($INFO['key'] = 'value') and array syntax ($INFO = array('key' => 'value'))
+                def first_match(patterns):
+                    for pattern in patterns:
+                        match = re.search(pattern, content)
+                        if match:
+                            return match.group(1)
+                    return None
+
+                host_value = first_match([
+                    r"\$INFO\s*\[\s*['\"]sql_host['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
+                    r"['\"]sql_host['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
+                ])
+                if host_value:
+                    # Handle optional host:port format (avoid IPv6 and socket paths)
+                    if host_value.count(':') == 1 and '/' not in host_value:
+                        host_part, port_part = host_value.rsplit(':', 1)
+                        if host_part:
+                            db_config['host'] = host_part
+                        if port_part.isdigit():
+                            db_config['port'] = port_part
+                    else:
+                        db_config['host'] = host_value
+
+                db_value = first_match([
+                    r"\$INFO\s*\[\s*['\"]sql_database['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
+                    r"['\"]sql_database['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
+                ])
+                if db_value:
+                    db_config['name'] = db_value
+
+                user_value = first_match([
+                    r"\$INFO\s*\[\s*['\"]sql_user['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
+                    r"['\"]sql_user['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
+                ])
+                if user_value:
+                    db_config['user'] = user_value
+
+                pass_value = first_match([
+                    r"\$INFO\s*\[\s*['\"]sql_pass['\"]\s*\]\s*=\s*['\"]([^'\"]*)['\"]",
+                    r"['\"]sql_pass['\"]\s*=>\s*['\"]([^'\"]*)['\"]",
+                ])
+                if pass_value is not None:
+                    db_config['password'] = pass_value
+
+                # Optional explicit port key
+                port_value = first_match([
+                    r"\$INFO\s*\[\s*['\"]sql_port['\"]\s*\]\s*=\s*['\"](\d+)['\"]",
+                    r"['\"]sql_port['\"]\s*=>\s*['\"](\d+)['\"]",
+                ])
+                if port_value and port_value.isdigit():
+                    db_config['port'] = port_value
                     
             except Exception as e:
                 self.log_warning(f"Error reading conf_global.php: {e}")
