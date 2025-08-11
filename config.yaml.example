@@ -1,0 +1,48 @@
+# Backup Configuration File
+
+# Global Settings
+global:
+  discord_webhook_url: "https://discord.com/api/webhooks/your-webhook-url-here"
+  s3:
+    endpoint: "https://your-account-id.r2.cloudflarestorage.com"
+    bucket: "your-backup-bucket"
+    access_key: "your-access-key"
+    secret_key: "your-secret-key"
+    region: "auto"
+
+# Default settings (can be overridden per site)
+defaults:
+  retention_days: 7
+  compression_level: 6
+  backup_database: true
+
+# Site Configurations
+sites:
+  - name: "website1-com"
+    user_path: "/home/www-website1-com"
+    retention_days: 14
+    backup_database: true
+    compression_level: 6
+    exclude_patterns:
+      - "cache/*"
+      - "logs/*"
+      - "*.log"
+  
+  - name: "blog-website2-com"
+    user_path: "/home/blog-website2-com"
+    retention_days: 7
+    backup_database: true
+    compression_level: 9
+    exclude_patterns:
+      - "wp-content/cache/*"
+      - "wp-content/uploads/cache/*"
+  
+  - name: "app-website3-com"
+    user_path: "/home/app-website3-com"
+    retention_days: 30
+    backup_database: false
+    compression_level: 3
+    exclude_patterns:
+      - "storage/logs/*"
+      - "bootstrap/cache/*"
+      - "node_modules/*"
