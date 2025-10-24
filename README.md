@@ -17,21 +17,40 @@ this script will backup all your files, and not just the database.
 
 ## Installation
 
-1. **Or use the installation script:**
+1. SSH into your Forge server as the `forge` user.
+
+2. ```bash
+   cd /home/forge && git clone https://github.com/alexmck/laravel-forge-complete-backup.git && cd laravel-forge-complete-backup
+   ```
+
+1. **Run the installation script:**
    ```bash
    chmod +x install.sh
    ./install.sh
+   ```
+
+   To run this automatically at 3:00 AM every day via cron, add an entry like this (update the absolute paths to match your system). You can either use `crontab -e` via SSH to add this, or you can add it as a scheduled job via the Laravel Forge web interface.
+
+   ```bash
+   0 3 * * * /home/forge/laravel-forge-complete-backup/venv/bin/python /home/forge/laravel-forge-complete-backup/backup.py >> /home/forge/laravel-forge-complete-backup/cron.log 2>&1
    ```
 
 ## Configuration
 
 The script uses the `config.yaml` file. See the `config.yaml.example` file and copy it as necessary.
 
-## Usage
+## Manually Running a Backup
 
 ```bash
 source venv/bin/activate
 python3 backup.py
+```
+
+## Updating Backup Script
+
+```bash
+cd /home/forge/laravel-forge-complete-backup
+git pull origin main
 ```
 
 ## Dependencies

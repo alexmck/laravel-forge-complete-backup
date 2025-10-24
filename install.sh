@@ -10,7 +10,8 @@ echo "Current Python version: $CURRENT_PYTHON_VERSION"
 
 # Determine if we need to upgrade Python
 NEED_UPGRADE=false
-if [[ "$CURRENT_PYTHON_VERSION" < "3.8" ]]; then
+REQUIRED_VERSION="3.8"
+if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$CURRENT_PYTHON_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]; then
     echo "Python version < 3.8 detected. Recommending pyenv for Python management..."
     NEED_UPGRADE=true
 else
