@@ -609,10 +609,20 @@ class BackupScript:
                 return True
             else:
                 self.log_error(f"Failed to upload backup: {local_backup_path.name}")
+                self.send_discord_notification(
+                    "❌ **Backup Failed**",
+                    f"Site: {site_name}\nReason: Failed to upload backup to S3",
+                    15158332  # Red color
+                )
                 return False
                 
         except Exception as e:
             self.log_error(f"Failed to backup site {site_name}: {e}")
+            self.send_discord_notification(
+                "❌ **Backup Failed**",
+                f"Site: {site_name}\nReason: {str(e)}",
+                15158332  # Red color
+            )
             return False
         finally:
             # Clean up temporary directory
