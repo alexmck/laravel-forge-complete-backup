@@ -571,6 +571,7 @@ class BackupScript:
             
         # Create temporary backup directory
         temp_dir = Path(tempfile.mkdtemp(prefix=f"backup_{site_name}_"))
+        local_backup_path = None
         
         try:
             # Backup database if enabled
@@ -614,6 +615,9 @@ class BackupScript:
                     f"Site: {site_name}\nReason: Failed to upload backup to S3",
                     15158332  # Red color
                 )
+                # Clean up local backup file on failure
+                local_backup_path.unlink(missing_ok=True)
+                self.log_info(f"Local backup removed after failure: {local_backup_path.name}")
                 return False
                 
         except Exception as e:
@@ -623,6 +627,10 @@ class BackupScript:
                 f"Site: {site_name}\nReason: {str(e)}",
                 15158332  # Red color
             )
+            # Clean up local backup file if it was created before the exception
+            if local_backup_path and local_backup_path.exists():
+                local_backup_path.unlink(missing_ok=True)
+                self.log_info(f"Local backup removed after exception: {local_backup_path.name}")
             return False
         finally:
             # Clean up temporary directory
