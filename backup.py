@@ -17,7 +17,7 @@ import tempfile
 import shutil
 import socket
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -203,7 +203,7 @@ class BackupScript:
             
         try:
             hostname = socket.gethostname()
-            timestamp = datetime.utcnow().isoformat() + "Z"
+            timestamp = datetime.now(timezone.utc).isoformat() + "Z"
             
             payload = {
                 "embeds": [{
