@@ -1,1 +1,5 @@
+backup.log
+backups/
+config.yaml
+cron.log
 venv/
