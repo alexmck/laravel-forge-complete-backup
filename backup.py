@@ -3,7 +3,7 @@
 """
 Laravel Forge Complete Backup
 Author: Alex McKenzie
-Version: 0.2
+Version: 0.2.1
 Description: Automated backup solution for Laravel Forge managed servers
 """
 
@@ -59,8 +59,8 @@ class BackupScript:
         self.defaults = {}
         self.sites = []
         self.logger = None
-        self.skip_success_notifications = False
-        self.skip_summary_notification = False
+        self.success_notification = True
+        self.summary_notification = True
         self.setup_logging()
         
     def setup_logging(self):
@@ -149,8 +149,8 @@ class BackupScript:
         # Extract global settings
         global_config = self.config.get('global', {})
         self.discord_webhook_url = global_config.get('discord_webhook_url', '')
-        self.skip_success_notifications = global_config.get('skip_success_notifications', False)
-        self.skip_summary_notification = global_config.get('skip_summary_notification', False)
+        self.success_notification = global_config.get('success_notification', True)
+        self.summary_notification = global_config.get('summary_notification', True)
         
         # S3 configuration
         s3_config = global_config.get('s3', {})
@@ -559,11 +559,11 @@ class BackupScript:
         backup_db = site_config.get('backup_database', self.defaults.get('backup_database', True))
         compression_level = site_config.get('compression_level', self.defaults.get('compression_level', 6))
         exclude_patterns = site_config.get('exclude_patterns', [])
-        # Check if we should skip success notification (per-site overrides global)
+        # Check if we should send success notification (per-site overrides global)
         # If not specified or explicitly null, use global setting
-        skip_success = site_config.get('skip_success_notification')
-        if skip_success is None:
-            skip_success = self.skip_success_notifications
+        success_notification = site_config.get('success_notification')
+        if success_notification is None:
+            success_notification = self.success_notification
         
         self.log_info(f"Starting backup for site: {site_name}")
         self.log_info(f"Path: {user_path}, Retention: {retention_days} days, DB: {backup_db}")
@@ -604,7 +604,7 @@ class BackupScript:
             
             if self.upload_to_s3(local_backup_path, s3_key):
                 self.log_success(f"Upload completed: {local_backup_path.name}")
-                if not skip_success:
+                if success_notification:
                     self.send_discord_notification(
                         "✅ **Backup Successful**",
                         f"Site: {site_name}\nSize: {backup_size_mb:.1f} MB\nFile: {local_backup_path.name}",
@@ -673,8 +673,8 @@ class BackupScript:
             else:
                 failed_backups += 1
                 
-        # Send summary notification (if not skipped)
-        if not self.skip_summary_notification:
+        # Send summary notification (if enabled)
+        if self.summary_notification:
             summary = f"**Backup Summary**\n"
             summary += f"Sites processed: {site_count}\n"
             summary += f"Successful: {successful_backups}\n"

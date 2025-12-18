@@ -3,8 +3,8 @@
 # Global Settings
 global:
   discord_webhook_url: "https://discord.com/api/webhooks/your-webhook-url-here"
-  skip_success_notifications: false  # Skip notifications for successful backups (can be overridden per site)
-  skip_summary_notification: false   # Skip the backup summary notification at the end
+  success_notification: true   # Send notifications for successful backups (can be overridden per site)
+  summary_notification: true  # Send the backup summary notification at the end
   s3:
     endpoint: "https://your-account-id.r2.cloudflarestorage.com"
     bucket: "your-backup-bucket"
@@ -25,7 +25,7 @@ sites:
     retention_days: 14
     backup_database: true
     compression_level: 6
-    skip_success_notification: false  # Skip success notification for this site (overrides global setting)
+    success_notification: true  # Send success notification for this site (overrides global setting)
     exclude_patterns:
       - "cache/*"
       - "logs/*"
@@ -45,7 +45,7 @@ sites:
     retention_days: 30
     backup_database: false
     compression_level: 3
-    skip_success_notification: true  # Skip success notification for this site (overrides global setting)
+    success_notification: false  # Disable success notification for this site (overrides global setting)
     exclude_patterns:
       - "storage/logs/*"
       - "bootstrap/cache/*"
