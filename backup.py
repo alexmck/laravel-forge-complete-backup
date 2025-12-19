@@ -497,7 +497,7 @@ class BackupScript:
             self.log_error(f"Failed to upload to S3: {e}")
             return False
             
-    def cleanup_old_backups(self, site_name: str, retention_days: int):
+    def cleanup_old_backups(self, site_name: str, retention_days: int, success_notification: bool = True):
         """Clean up old backups"""
         self.log_info(f"Cleaning up old backups for {site_name} (keeping {retention_days} days)")
         
@@ -538,11 +538,12 @@ class BackupScript:
                         )
                         filename = backup['key'].split('/')[-1]
                         self.log_success(f"Deleted old backup: {filename}")
-                        self.send_discord_notification(
-                            "🗑️ **Old Backup Deleted**",
-                            f"Site: {site_name}\nFile: {filename}",
-                            10181046
-                        )
+                        if success_notification:
+                            self.send_discord_notification(
+                                "🗑️ **Old Backup Deleted**",
+                                f"Site: {site_name}\nFile: {filename}",
+                                10181046
+                            )
                         deleted_count += 1
                     except Exception as e:
                         filename = backup['key'].split('/')[-1]
@@ -612,7 +613,7 @@ class BackupScript:
                     )
                 
                 # Clean up old backups
-                self.cleanup_old_backups(site_name, retention_days)
+                self.cleanup_old_backups(site_name, retention_days, success_notification)
                 
                 # Remove local backup
                 local_backup_path.unlink()
