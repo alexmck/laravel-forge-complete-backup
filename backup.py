@@ -203,7 +203,9 @@ class BackupScript:
             
         try:
             hostname = socket.gethostname()
-            timestamp = datetime.now(timezone.utc).isoformat() + "Z"
+            # Format timestamp in RFC3339 format (ISO 8601) as required by Discord
+            # Replace timezone offset with Z to avoid invalid format like "+00:00Z"
+            timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
             
             payload = {
                 "embeds": [{
