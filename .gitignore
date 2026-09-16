@@ -3,3 +3,13 @@ backups/
 config.yaml
 cron.log
 venv/
+.backup-work/
+restic.env
+restic-password
+backup.lock
+__pycache__/
+.pytest_cache/
+bin/restic
+
+config.yaml.previous
+RECOVERY.md
