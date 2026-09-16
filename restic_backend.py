@@ -119,7 +119,11 @@ class Restic:
                 raise ValueError('snapshot mismatch')
         except (ValueError, KeyError, IndexError, TypeError):
             raise BackupError("Could not verify completed snapshot identity") from None
-        return completed
+        # Missing statistics are unknown, not zero. Keep the compressed amount
+        # distinct from the uncompressed data_added value.
+        stats = {key: value for key in ('total_bytes_processed', 'data_added_packed')
+                 if type(value := summary.get(key)) is int and value >= 0}
+        return {'snapshot': completed, 'stats': stats}
 
     def forget(self, site, server):
         retention = site['retention']

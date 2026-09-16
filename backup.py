@@ -172,16 +172,18 @@ class BackupScript:
                         'created_at': datetime.now(timezone.utc).isoformat()}
             (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
             phase = 'Restic snapshot'
-            snapshot = self.restic.backup(site, stage, self.settings['server_id'])
+            result = self.restic.backup(site, stage, self.settings['server_id'])
+            snapshot = result['snapshot']
+            stats = result['stats']
             try:
                 self.restic.forget(site, self.settings['server_id'])
             except BackupError as error:
                 logging.error('Site %s backed up, but retention failed: %s', name, error)
-                report('warning', snapshot=snapshot, database=database, error=str(error))
+                report('warning', snapshot=snapshot, database=database, stats=stats, error=str(error))
                 return True, False
             logging.info('Site %s complete; snapshot %s', name, snapshot)
             if site['success_notification']:
-                report('success', snapshot=snapshot, database=database)
+                report('success', snapshot=snapshot, database=database, stats=stats)
             return True, True
         except (BackupError, OSError) as error:
             # OSError may include paths but not credential contents.

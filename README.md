@@ -1,89 +1,222 @@
 # Laravel Forge Complete Backup
 
-Back up configured Forge site directories and MySQL/MariaDB databases to an encrypted
+Back up configured Forge site directories and MySQL databases to an encrypted
 restic repository, including S3-compatible storage such as Cloudflare R2. Python
 processes sites sequentially and sends per-site and summary Discord notifications.
 No Forge API or particular Forge plan is required.
 
-## What counts as success
-
-A database-enabled site succeeds only after its SQL dump exits successfully, is
-nonempty, has a completion footer, and its files and SQL are saved in a successful
-restic snapshot. Partial snapshots (including restic exit 3) never receive the
-`complete` tag. Backup, retention, or scheduled maintenance failures return a
-nonzero process status. Other sites continue after a site fails.
-
-A retention failure is reported separately: the new backup still exists. Discord
-delivery failure is logged, but does not invalidate a backup. Disabling success
-notifications never disables failure notifications.
-
-Discord notifications use compact embeds with green success, amber warnings and
-red failures. Site cards show the server, elapsed time, database validation/size,
-retention policy and a copyable snapshot ID. Failures show the stage and reason.
-Run summaries show successful/failed counts and identify sites needing attention.
-Mentions are disabled, and large summaries are shortened to fit Discord's limits.
-Existing global/per-site success controls and the summary toggle still apply.
-
 ## Install on Ubuntu / Forge
 
-1. Have these ready:
-   - An existing R2 bucket, its account ID, and an R2 API access key/secret with
-     read/write/delete access to the bucket. Other S3-compatible HTTPS endpoints
-     are also supported.
-   - A repository password saved in your password manager. Keep it and the
-     repository address outside the VPS: **losing every copy of the password makes
-     the encrypted backups unrecoverable**.
-   - Optionally a Discord webhook URL. The wizard detects common Forge site paths.
+These steps install **v0.3.1** on a fresh Ubuntu 22.04, 24.04 or 26.04 Forge
+server using the `forge` account. For Ubuntu 20.04, see
+[Python requirements below](#prerequisites-and-ubuntu-versions) before continuing.
+For an existing v0.2.1 installation, use the [migration guide](#migration-from-v021).
+Run each step in order and stop if a command fails.
 
-2. SSH in as the account that will run backups, then run:
+### 1. SSH into the server
 
-   ```bash
-   git clone https://github.com/alexmck/laravel-forge-complete-backup.git
-   cd laravel-forge-complete-backup
-   bash install.sh
-   ```
+From a terminal on your computer, replace `SERVER_IP` with the server's IP address:
 
-   ![Example setup wizard detecting Laravel, WordPress and static sites](docs/images/setup-wizard.png)
+```bash
+ssh forge@SERVER_IP
+```
 
-   *Illustrative terminal preview using actual wizard output and fictional sites.*
+If you are already connected as `forge`, continue below. Run setup as `forge`,
+without `sudo`.
 
-3. Follow the prompts. The installer:
-   - Checks Python support, existing virtual environments, database dump tools and
-     cron before installing dependencies or asking for credentials.
-   - Installs Python dependencies and a checksum-verified restic binary.
-   - Asks for storage credentials and the saved repository password. Secret inputs
-     are hidden.
-   - Lists detected sites from `/home` and enabled Nginx configurations. Choose
-     `all` (the default), numbers such as `1,3` or `1-3`, or `manual` to enter paths.
-   - Detects database configuration and includes the database automatically when
-     found. Ambiguous or unsupported settings require a selection or explicit
-     files-only choice. Static sites without database configuration use files-only
-     backups; other sites without detected settings prompt for confirmation.
-   - Writes `config.yaml`, `restic.env` and `restic-password` with `0600` permissions.
-   - Connects to an existing repository or initializes a missing one. Authentication
-     and connection errors stop setup; they do not trigger initialization.
-   - Generates a private `RECOVERY.md` with this installation's repository address,
-     site filters and download/decryption commands. It contains no credentials.
-   - Offers to run the first backup and install daily cron jobs for the current user.
+Have your R2 bucket name, Cloudflare account ID, R2 S3 access key ID / secret,
+and a repository password saved in your password manager ready for the wizard.
+The storage credentials need read/write/delete access to the bucket. An optional
+Discord webhook enables notifications.
 
-Defaults are **7 daily / 4 weekly / 12 monthly** retention, sequential site backups,
-and weekly repository maintenance. The proposed cron jobs run backups at **03:00**
-and check for due maintenance at **05:00**, in the server's local time. Decline cron
-installation if you prefer Forge's scheduler; the exact entries are printed.
-Existing backup jobs outside the installer's managed block are not replaced.
+One repository and password cover all selected sites on this server. Keep the
+password outside the VPS: **losing it makes the backups unrecoverable**. Do not
+configure object-expiration lifecycle rules on the backup repository prefix.
 
-Site discovery supports standard Forge directories, isolated users and `current`
-deployment layouts. It inspects user directories and one site level beneath them,
-plus literal Nginx `root` paths; it does not recursively search the server. Missing
-sites can be added manually. Run as a user with access to the selected sites and
-their database configuration; discovery does not grant permissions.
+### 2. Download the release and start setup
 
-For an existing checkout, run `bash install.sh` there. Existing configuration,
-passwords and the virtual environment are reused. An existing configuration opens
-a management menu. Rerunning setup does not duplicate
-its cron jobs. If a backup or connection fails, settings stay saved so you can
-correct the problem and rerun. Legacy `global.s3` configuration requires the
-[migration steps below](#migration-from-v021).
+```bash
+cd /home/forge
+git clone --branch v0.3.1 https://github.com/alexmck/laravel-forge-complete-backup.git
+cd /home/forge/laravel-forge-complete-backup
+bash install.sh
+```
+
+Use Forge's existing system tools, including `mysqldump`; no separate MySQL client
+installation is needed when that command is present. The installer checks
+prerequisites and installs the project's Python libraries and restic automatically.
+If it reports a missing requirement, follow the specific remedy in
+[dependency troubleshooting](#dependency-troubleshooting), then rerun setup.
+
+Git's “detached HEAD” message is expected when checking out a release tag.
+If the directory already exists, do not delete it or clone over it. For an existing
+v0.3.1 checkout, enter that directory and rerun `bash install.sh`.
+
+![Example setup wizard detecting Laravel, WordPress and static sites](docs/images/setup-wizard.png)
+
+*Illustrative terminal preview using actual wizard output and fictional sites.*
+
+### 3. Complete the wizard
+
+Answer the prompts as follows:
+
+| Prompt | What to enter |
+| --- | --- |
+| Server name | Press Enter to use the hostname, or enter a stable, unique server name. |
+| R2 account ID or S3 HTTPS endpoint | Paste your Cloudflare account ID. |
+| Existing bucket name | Enter your existing R2 bucket name. |
+| Repository prefix | Press Enter to use the server name. Use a different prefix for each server sharing a bucket. |
+| S3 access key ID / secret access key | Paste the R2 S3 credentials. Input is hidden. |
+| Repository password / confirmation | Paste the saved password twice. Input is hidden. |
+| Discord webhook URL | Paste the URL, or press Enter to disable notifications. |
+| Sites to back up | Press Enter for all detected sites, or enter `1,3`, `1 3`, or `1-3`. Use `manual` to enter a site path yourself. |
+| Database configuration, if prompted | Choose the correct config file. Enter `none` only if you intentionally want files without a database backup. |
+| Add a site manually? | Enter `n` if the list already includes everything you want. |
+| Run the first backup now? | Enter `y` and wait for it to complete. |
+| Install these jobs in this user's crontab? | Enter `n` to manage the jobs in Forge using step 4 below (recommended). Enter `y` only if you prefer the installer's direct cron scheduling. |
+
+The wizard detects standard, isolated-user and zero-downtime Forge layouts. It
+backs up the containing deployment directory, including releases and shared files.
+Missing or unreadable sites need manual attention; discovery does not change
+permissions. Database settings are read from supported application configuration.
+
+The default schedule is **03:00 backups / 05:00 maintenance**, in the server's local
+timezone. Retention is **7 daily / 4 weekly / 12 monthly**. Maintenance runs only
+when due, normally weekly. Do not also add duplicate jobs in Forge.
+
+If the first backup fails, fix the reported issue and rerun:
+
+```bash
+cd /home/forge/laravel-forge-complete-backup
+venv/bin/python scripts/setup.py
+```
+
+Choose **1 — Continue** to retry. Saved settings and passwords are reused.
+
+### 4. Schedule backups in Forge
+
+Choose **one** scheduling method. The instructions below use Forge so both jobs
+are visible and editable in its dashboard. Answer **`n`** to the installer's
+crontab prompt. Direct cron installation does not register jobs through Forge.
+
+1. Open your server in Forge. On **Overview**, find **Scheduled jobs** and click
+   **+**. Alternatively, open **Processes → Scheduler → Add scheduled job**.
+2. Create **Daily backup** using the settings and command below, then click
+   **Create scheduled job**.
+3. Add a second job named **Backup maintenance** using its settings and command.
+4. Confirm that both jobs show **Installed** in the scheduled jobs list.
+
+| Field | Daily backup | Backup maintenance |
+| --- | --- | --- |
+| Name | `Daily backup` | `Backup maintenance` |
+| User | `forge` | `forge` |
+| Frequency | Custom frequency | Custom frequency |
+| Custom schedule | `0 3 * * *` | `0 5 * * *` |
+| Monitor with heartbeats | Off | Off |
+
+**Daily backup — Command:**
+
+```bash
+/usr/bin/nice -n 10 /home/forge/laravel-forge-complete-backup/venv/bin/python /home/forge/laravel-forge-complete-backup/backup.py backup
+```
+
+**Backup maintenance — Command:**
+
+```bash
+/usr/bin/nice -n 10 /home/forge/laravel-forge-complete-backup/venv/bin/python /home/forge/laravel-forge-complete-backup/backup.py maintenance
+```
+
+Paste the entire command, including the Python interpreter path. Put the cron
+expression in **Custom schedule**, not in **Command**. Adjust the paths if you
+installed somewhere else.
+
+The default times are **03:00** and **05:00** in the server's timezone. Check
+Forge's **Next expected run** and its displayed timezone before saving.
+Leave enough time for the backup to finish before maintenance starts. Maintenance
+is scheduled daily so failed work retries the next day; repository checks and
+pruning normally run only when due each week.
+
+Keep **Monitor with heartbeats** off for these commands. Forge heartbeats require
+an explicit success ping, which these commands do not send. Discord notifications
+continue to work independently if configured.
+
+![Forge scheduled jobs list with Daily backup and Backup maintenance both marked Installed](docs/images/forge-scheduled-jobs.png)
+
+**Installed** confirms that Forge created the schedule; it does not mean the job
+has run yet. The initial backup was run by the wizard. For additional manual runs,
+use SSH and `venv/bin/python backup.py backup`: Forge's **Run** action has a
+60-second timeout, while regular scheduled runs do not have that limit.
+See [Forge's scheduler documentation](https://laravel.com/forge/docs/resources/scheduler).
+
+#### Alternative: use the installer's cron scheduling
+
+If you answered **`y`** to the crontab prompt, skip creating jobs in Forge. Check
+the direct cron installation from SSH:
+
+```bash
+crontab -l
+systemctl is-active cron
+date
+```
+
+Check that the crontab contains the `backup.py backup` and `backup.py maintenance`
+jobs and cron reports `active`. If cron is inactive:
+
+```bash
+sudo systemctl enable --now cron
+```
+
+To switch from installer-managed cron to Forge, run `crontab -e` and remove only
+the block between `# BEGIN forge-backups ...` and `# END forge-backups ...`,
+including those markers. Preserve unrelated jobs, then create the two Forge jobs.
+Do not leave both scheduling methods active.
+
+### 5. Keep recovery instructions off the server
+
+From a **new terminal on your own computer**, replace `SERVER_IP` and download the
+generated guide:
+
+```bash
+scp forge@SERVER_IP:/home/forge/laravel-forge-complete-backup/RECOVERY.md ./forge-backup-recovery.md
+```
+
+Save the guide alongside the repository password in your password manager. It
+contains your repository address and restore commands, but no credentials. Keep a
+copy of the password outside the server; the guide cannot replace it.
+
+Installation is complete after the first backup and scheduling. For a manual backup
+later, run on the server:
+
+```bash
+cd /home/forge/laravel-forge-complete-backup
+venv/bin/python backup.py backup
+```
+
+To download and decrypt a snapshot without importing a database, follow the saved
+recovery guide or [local restore instructions below](#download-decrypt-and-verify-a-backup-locally).
+
+### Update from v0.3.0 to v0.3.1
+
+On each server, as `forge`, run:
+
+```bash
+cd /home/forge/laravel-forge-complete-backup
+git status --short
+git fetch origin --tags
+git switch --detach v0.3.1
+```
+
+If `git status` lists tracked files you have edited, preserve those changes before
+switching versions; do not use a forced checkout. Ignored configuration, storage
+credentials and the repository password remain in place. Existing Forge/cron jobs
+use the updated code automatically on their next run. This patch does not change
+Python dependencies or require rerunning setup or initializing the repository.
+
+To verify the new Discord size fields immediately, run:
+
+```bash
+venv/bin/python backup.py backup
+```
 
 ### Manage an existing installation
 
@@ -144,6 +277,38 @@ PYTHON_BIN=/absolute/path/to/python3.12 bash install.sh
 Do not replace Ubuntu's system Python. An existing virtual environment using an
 older Python must be moved aside before creating one with the newer interpreter.
 
+### Dependency troubleshooting
+
+Only install a system package if the installer reports it missing. `which` and
+`command -v` look for executable commands, not Ubuntu package names:
+
+| Package | How it is used |
+| --- | --- |
+| `mysql-client` | Provides MySQL tools such as `mysqldump`; there is no `mysql-client` command. |
+| `python3-venv` | Provides Python virtual-environment support; there is no `python3-venv` command. |
+| `ca-certificates` | Provides trusted certificates for HTTPS; there is no `ca-certificates` command. |
+
+For missing virtual-environment support with Ubuntu's system Python:
+
+```bash
+sudo apt-get update
+sudo apt-get install python3-venv
+bash install.sh
+```
+
+For a separately installed Python, use its matching venv package instead. Python
+3.10+ is required; installing venv does not upgrade an older interpreter.
+
+If the check reports a missing MySQL dump client, verify the executable:
+
+```bash
+command -v mysqldump
+```
+
+If absent, install the client appropriate to your existing database installation.
+For MySQL, the Ubuntu package is `mysql-client`. This is an exception path; a Forge
+server with `mysqldump` already installed needs no additional database package.
+
 ### Advanced installation and configuration
 
 Use `bash install.sh --skip-setup` to install dependencies without interactive
@@ -175,6 +340,21 @@ restic manages retention itself.
 The environment file accepts AWS access keys, session token, region, and
 `RESTIC_PASSWORD_FILE`/`RESTIC_PASSWORD`. Shell commands and interpolation are not
 evaluated. A configured password file takes precedence over a password variable.
+
+## Discord backup sizes
+
+Each successful site notification (including a saved backup with a retention warning)
+shows three separate sizes:
+
+- **Database size:** the validated, uncompressed SQL dump only.
+- **Total files processed:** the uncompressed size processed by restic, including
+  site files, the SQL dump when enabled, and backup metadata.
+- **Data uploaded:** new compressed data added to the repository during this backup.
+  Restic reuses existing data, so this can be much smaller than the total processed.
+  It is restic's reported data addition, not an exact network-traffic measurement
+  or the total repository size.
+
+Sizes use KiB/MiB/GiB. Unreported statistics show **Unavailable**, not zero.
 
 ## Resource usage
 
@@ -297,8 +477,8 @@ Do not blindly restore `latest` without the complete/site filters below.
 
 ## Schedule and operate
 
-Configure two Forge scheduled jobs (or cron entries), using the same account and
-absolute paths. Run maintenance daily so a failed weekly operation retries the
+For Forge dashboard setup, follow [step 4 above](#4-schedule-backups-in-forge).
+For direct cron, use the entries below with the same account and absolute paths. Run maintenance daily so a failed weekly operation retries the
 next day. The state file determines whether checks/pruning are due. Adjust hours
 to leave enough time for your backups; all commands share a nonblocking local lock.
 An overlapping job exits nonzero and sends a failure notification.
@@ -308,7 +488,7 @@ An overlapping job exits nonzero and sends a failure notification.
 0 5 * * * /usr/bin/nice -n 10 /home/forge/laravel-forge-complete-backup/venv/bin/python /home/forge/laravel-forge-complete-backup/backup.py maintenance >> /home/forge/laravel-forge-complete-backup/cron.log 2>&1
 ```
 
-Use logrotate to bound the size of `cron.log`. Logs go to stderr; there is no duplicate
+The direct cron entries above write to `cron.log`; use logrotate to bound its size. Logs go to stderr; there is no duplicate
 `backup.log`. SIGTERM/interrupts terminate child process groups and clean temporary
 credentials/dumps where possible. OS locks release on exit. A hard kill can leave
 staging files; each site's staging is cleared before its next backup and stale

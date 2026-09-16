@@ -59,7 +59,7 @@ def notification(title, description, status, fields, category):
 
 
 def site_notification(server, site, status, elapsed, *, snapshot=None, database=None,
-                      error=None, phase=None):
+                      stats=None, error=None, phase=None):
     fields = [field('Site', site['name']), field('Server', server),
               field('Elapsed', duration(elapsed))]
     if status == 'error':
@@ -77,7 +77,14 @@ def site_notification(server, site, status, elapsed, *, snapshot=None, database=
             if database and 'bytes' in database:
                 sql += f" · {byte_size(database['bytes'])}"
         policy = site['retention']
-        fields.append(field('Database', sql))
+        fields.append(field('Database size', sql))
+        stats = stats or {}
+        for label, key, detail in (
+                ('Total files processed', 'total_bytes_processed', 'Files + SQL + metadata · uncompressed'),
+                ('Data uploaded', 'data_added_packed', 'New data added · compressed')):
+            count = stats.get(key)
+            value = byte_size(count) if type(count) is int and count >= 0 else 'Unavailable'
+            fields.append(field(label, f'{value}\n{detail}'))
         fields.append(field('Retention', 'Needs attention' if status == 'warning' else
                             f"{policy['daily']} daily · {policy['weekly']} weekly · {policy['monthly']} monthly"))
         if snapshot:
