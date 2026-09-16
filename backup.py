@@ -1,711 +1,262 @@
 #!/usr/bin/env python3
-
-"""
-Laravel Forge Complete Backup
-Author: Alex McKenzie
-Version: 0.2.1
-Description: Automated backup solution for Laravel Forge managed servers
-"""
-
-import os
-import sys
+"""Sequential Forge site backups with validated SQL, restic and Discord."""
+import argparse
+import fcntl
 import json
-import yaml
 import logging
-import subprocess
-import tempfile
+import os
+import re
 import shutil
-import socket
 import signal
+import socket
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
 
-# Third-party imports
-try:
-    import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError
-except ImportError:
-    print("Error: boto3 is required. Install with: pip install boto3")
-    sys.exit(1)
+import requests
+import yaml
 
-try:
-    import requests
-except ImportError:
-    print("Error: requests is required. Install with: pip install requests")
-    sys.exit(1)
+from database import dump_database
+from notifications import job_failure, site_notification, summary_notification
+from restic_backend import Restic
+from runtime import BackupError, check_space, private_directory
 
-# Configuration
-SCRIPT_DIR = Path(__file__).parent.absolute()
-CONFIG_FILE = SCRIPT_DIR / "config.yaml"
-BACKUP_DIR = SCRIPT_DIR / "backups"
-LOG_FILE = SCRIPT_DIR / "backup.log"
-LOCK_FILE = SCRIPT_DIR / "backup.lock"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-# ANSI color codes
-class Colors:
-    RED = '\033[0;31m'
-    GREEN = '\033[0;32m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[0;34m'
-    NC = '\033[0m'  # No Color
+
+def positive_int(value, name, allow_zero=False):
+    if type(value) is not int or value < (0 if allow_zero else 1):
+        raise BackupError(f'{name} must be a {"nonnegative" if allow_zero else "positive"} integer')
+    return value
+
+
+def load_config(path):
+    try:
+        config = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        raise BackupError('Cannot read configuration YAML') from None
+    if not isinstance(config, dict):
+        raise BackupError('Configuration must be a mapping')
+    global_config = config.get('global', {})
+    defaults = config.get('defaults', {})
+    sites = config.get('sites', [])
+    if not isinstance(global_config, dict) or not isinstance(defaults, dict) or not isinstance(sites, list) or not sites:
+        raise BackupError('global/defaults must be mappings and sites must be a nonempty list')
+    if 's3' in global_config:
+        raise BackupError('Legacy global.s3 configuration: migrate to global.restic (see README)')
+    restic = global_config.get('restic', {})
+    if not isinstance(restic, dict) or not isinstance(restic.get('repository'), str) or not restic['repository']:
+        raise BackupError('global.restic.repository is required')
+    restic['config_file'] = str(path)
+    for key in ('environment_file', 'password_file'):
+        if key in restic and (not isinstance(restic[key], str) or not Path(restic[key]).is_absolute()):
+            raise BackupError(f'restic.{key} must be absolute')
+    for name, default in [('cpu_cores', 1), ('connections', 2), ('timeout_seconds', 7200),
+                          ('check_interval_days', 7), ('check_subsets', 4), ('prune_interval_days', 7)]:
+        positive_int(restic.get(name, default), name)
+    if not re.fullmatch(r'\d+[KMGTP]?', str(restic.get('max_repack_size', '128M'))):
+        raise BackupError('max_repack_size must be a size such as 128M')
+    server = global_config.setdefault('server_id', socket.gethostname())
+    if not isinstance(server, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', server):
+        raise BackupError('server_id must contain only letters, digits, dots, underscores and hyphens')
+    for key in ('success_notification', 'summary_notification'):
+        if type(global_config.get(key, True)) is not bool:
+            raise BackupError(f'{key} must be true or false')
+    global_config['work_dir'] = str(Path(global_config.get('work_dir', path.parent / '.backup-work')).absolute())
+    positive_int(global_config.get('min_free_mb', 1024), 'min_free_mb')
+    names = set()
+    normalized = []
+    for raw in sites:
+        if not isinstance(raw, dict):
+            raise BackupError('Each site must be a mapping')
+        site = {**defaults, **raw}
+        if 'retention_days' in site or 'compression_level' in site:
+            raise BackupError('Replace retention_days/compression_level with retention; see README')
+        name = site.get('name')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name) or name in names:
+            raise BackupError('Site names must be unique, safe identifiers')
+        names.add(name)
+        root = site.get('user_path')
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            raise BackupError('Each user_path must be absolute')
+        site['user_path'] = str(Path(root).resolve())
+        if restic['repository'].startswith('/'):
+            repository = Path(restic['repository']).resolve()
+            if repository == Path(site['user_path']) or Path(site['user_path']) in repository.parents:
+                raise BackupError('A local repository must not be inside a backed-up site')
+        work = Path(global_config['work_dir']).resolve()
+        if work == Path(site['user_path']) or work in Path(site['user_path']).parents:
+            raise BackupError('Site paths must not be inside work_dir')
+        site.setdefault('backup_database', True)
+        if type(site['backup_database']) is not bool:
+            raise BackupError('backup_database must be true or false')
+        notify = site.get('success_notification')
+        if notify is None:
+            site['success_notification'] = global_config.get('success_notification', True)
+        elif type(notify) is not bool:
+            raise BackupError('success_notification must be true or false')
+        retention = {'daily': 7, 'weekly': 4, 'monthly': 12}
+        for source in (defaults, raw):
+            value = source.get('retention', {})
+            if not isinstance(value, dict) or set(value) - set(retention):
+                raise BackupError('retention supports daily, weekly and monthly')
+            retention.update(value)
+        for key, value in retention.items():
+            positive_int(value, f'retention.{key}', allow_zero=True)
+        if not any(retention.values()):
+            raise BackupError('At least one retention count must be positive')
+        site['retention'] = retention
+        patterns = site.get('exclude_patterns', [])
+        if not isinstance(patterns, list) or any(not isinstance(p, str) or not p or p.startswith(('/', '!')) or '..' in p.split('/') or '\n' in p for p in patterns):
+            raise BackupError('Exclusions must be nonempty relative patterns without negation or parent traversal')
+        database = site.get('database', {})
+        if not isinstance(database, dict):
+            raise BackupError('database must be a mapping')
+        positive_int(database.get('timeout_seconds', 1800), 'database.timeout_seconds')
+        for key in ('config_file', 'option_file'):
+            if key in database and (not isinstance(database[key], str) or not Path(database[key]).is_absolute()):
+                raise BackupError(f'database.{key} must be absolute')
+        normalized.append(site)
+    return global_config, normalized
+
 
 class BackupScript:
-    def __init__(self):
-        self.config = {}
-        self.s3_client = None
-        self.discord_webhook_url = ""
-        self.s3_config = {}
-        self.defaults = {}
-        self.sites = []
-        self.logger = None
-        self.success_notification = True
-        self.summary_notification = True
-        self.setup_logging()
-        
-    def setup_logging(self):
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(LOG_FILE),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        
-    def log(self, level: str, message: str):
-        """Log message with timestamp"""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        colored_message = f"{timestamp} [{level}] {message}"
-        
-        # Add color for console output
-        if level == "ERROR":
-            colored_message = f"{Colors.RED}{colored_message}{Colors.NC}"
-        elif level == "SUCCESS":
-            colored_message = f"{Colors.GREEN}{colored_message}{Colors.NC}"
-        elif level == "WARNING":
-            colored_message = f"{Colors.YELLOW}{colored_message}{Colors.NC}"
-        elif level == "INFO":
-            colored_message = f"{Colors.BLUE}{colored_message}{Colors.NC}"
-            
-        print(colored_message)
-        self.logger.info(message)
-        
-    def log_error(self, message: str):
-        """Log error message"""
-        self.log("ERROR", message)
-        
-    def log_success(self, message: str):
-        """Log success message"""
-        self.log("SUCCESS", message)
-        
-    def log_warning(self, message: str):
-        """Log warning message"""
-        self.log("WARNING", message)
-        
-    def log_info(self, message: str):
-        """Log info message"""
-        self.log("INFO", message)
-        
-    def check_lock(self):
-        """Check if script is already running"""
-        if LOCK_FILE.exists():
-            try:
-                pid = int(LOCK_FILE.read_text().strip())
-                # Check if process is still running
-                os.kill(pid, 0)
-                self.log_error(f"Backup script is already running (PID: {pid})")
-                sys.exit(1)
-            except (ValueError, OSError):
-                # Process not running, remove stale lock file
-                self.log_warning("Removing stale lock file")
-                LOCK_FILE.unlink(missing_ok=True)
-                
-        # Create lock file
-        LOCK_FILE.write_text(str(os.getpid()))
-        
-    def cleanup_and_exit(self, exit_code: int = 0):
-        """Cleanup and exit"""
-        LOCK_FILE.unlink(missing_ok=True)
-        sys.exit(exit_code)
-        
-    def load_config(self):
-        """Load configuration from YAML file"""
-        if not CONFIG_FILE.exists():
-            self.log_error(f"Configuration file not found: {CONFIG_FILE}")
-            sys.exit(1)
-            
-        self.log_info(f"Loading configuration from {CONFIG_FILE}")
-        
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                self.config = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            self.log_error(f"Error parsing YAML configuration: {e}")
-            sys.exit(1)
-            
-        # Extract global settings
-        global_config = self.config.get('global', {})
-        self.discord_webhook_url = global_config.get('discord_webhook_url', '')
-        self.success_notification = global_config.get('success_notification', True)
-        self.summary_notification = global_config.get('summary_notification', True)
-        
-        # S3 configuration
-        s3_config = global_config.get('s3', {})
-        self.s3_config = {
-            'endpoint_url': s3_config.get('endpoint'),
-            'bucket': s3_config.get('bucket'),
-            'access_key': s3_config.get('access_key'),
-            'secret_key': s3_config.get('secret_key'),
-            'region': s3_config.get('region', 'auto')
-        }
-        
-        # Validate required S3 settings
-        required_s3_fields = ['endpoint_url', 'bucket', 'access_key', 'secret_key']
-        missing_fields = [field for field in required_s3_fields if not self.s3_config.get(field)]
-        if missing_fields:
-            self.log_error(f"Missing required S3 configuration: {', '.join(missing_fields)}")
-            sys.exit(1)
-            
-        # Load defaults
-        self.defaults = self.config.get('defaults', {})
-        
-        # Load sites
-        self.sites = self.config.get('sites', [])
-        if not self.sites:
-            self.log_error("No sites configured in configuration file")
-            sys.exit(1)
-            
-        self.log_success("Configuration loaded successfully")
-        
-    def setup_s3_client(self):
-        """Setup S3 client"""
-        try:
-            self.s3_client = boto3.client(
-                's3',
-                endpoint_url=self.s3_config['endpoint_url'],
-                aws_access_key_id=self.s3_config['access_key'],
-                aws_secret_access_key=self.s3_config['secret_key'],
-                region_name=self.s3_config['region']
-            )
-            self.log_success("S3 client configured successfully")
-        except Exception as e:
-            self.log_error(f"Failed to setup S3 client: {e}")
-            sys.exit(1)
-            
-    def send_discord_notification(self, title: str, description: str, color: int = 3447003):
-        """Send Discord notification"""
-        if not self.discord_webhook_url:
-            self.log_warning("Discord webhook URL not configured")
+    def __init__(self, config_path):
+        self.settings, self.sites = load_config(config_path)
+        self.work_dir = private_directory(self.settings['work_dir'])
+        self.reserve = self.settings.get('min_free_mb', 1024) * 1024 * 1024
+        self.lock = None
+        self.restic = None
+
+    def notify(self, payload):
+        url = self.settings.get('discord_webhook_url')
+        if not url:
             return
-            
         try:
-            hostname = socket.gethostname()
-            # Format timestamp in RFC3339 format (ISO 8601) as required by Discord
-            # Replace timezone offset with Z to avoid invalid format like "+00:00Z"
-            timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-            
-            payload = {
-                "embeds": [{
-                    "title": title,
-                    "description": description,
-                    "color": color,
-                    "timestamp": timestamp,
-                    "footer": {
-                        "text": f"Server: {hostname}"
-                    }
-                }]
-            }
-            
-            response = requests.post(
-                self.discord_webhook_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
+            response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
-            
-        except Exception as e:
-            self.log_warning(f"Failed to send Discord notification: {e}")
-            
-    def extract_db_config(self, site_path: Path) -> Dict[str, str]:
-        """Extract database configuration from various config files"""
-        db_config = {
-            'host': 'localhost',
-            'name': '',
-            'user': '',
-            'password': '',
-            'port': '3306'
-        }
-        
-        # Check for .env file (Laravel/general)
-        env_file = site_path / '.env'
-        if env_file.exists():
-            self.log_info("Found .env file, extracting database config")
+        except requests.RequestException:
+            logging.warning('Discord notification could not be delivered')
+
+    def backup_site(self, site):
+        name = site['name']
+        stage = self.work_dir / 'staging' / name
+        snapshot = None
+        started = time.monotonic()
+        phase = 'Preparing site'
+        def report(status, **details):
+            self.notify(site_notification(self.settings['server_id'], site, status,
+                                          time.monotonic() - started, **details))
+        try:
+            root = Path(site['user_path'])
+            if not root.is_dir():
+                raise BackupError('Site directory does not exist')
+            with os.scandir(root) as entries:
+                next(entries, None)  # Detect an unreadable root before adding other sources.
+            # Clear leftovers from interrupted runs before constructing this snapshot.
+            if stage.exists():
+                if stage.is_symlink():
+                    raise BackupError('Staging directory must not be a symlink')
+                shutil.rmtree(stage)
+            private_directory(stage)
+            check_space(self.work_dir, self.reserve)
+            logging.info('Backing up site %s', name)
+            database = None
+            if site['backup_database']:
+                phase = 'Database dump and validation'
+                database = dump_database(site, stage, self.work_dir / 'secrets', self.reserve,
+                                         site.get('database', {}).get('timeout_seconds', 1800))
+            manifest = {'format': 1, 'site': name, 'server': self.settings['server_id'],
+                        'site_path': str(root), 'database': database,
+                        'created_at': datetime.now(timezone.utc).isoformat()}
+            (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+            phase = 'Restic snapshot'
+            snapshot = self.restic.backup(site, stage, self.settings['server_id'])
             try:
-                with open(env_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if '=' in line and not line.startswith('#'):
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip().strip('"\'')
-                            
-                            if key == 'DB_HOST':
-                                db_config['host'] = value
-                            elif key == 'DB_DATABASE':
-                                db_config['name'] = value
-                            elif key == 'DB_USERNAME':
-                                db_config['user'] = value
-                            elif key == 'DB_PASSWORD':
-                                db_config['password'] = value
-                            elif key == 'DB_PORT':
-                                db_config['port'] = value
-            except Exception as e:
-                self.log_warning(f"Error reading .env file: {e}")
-                
-        # Check for wp-config.php (WordPress)
-        wp_config = site_path / 'public/wp-config.php'
-        if wp_config.exists():
-            self.log_info("Found wp-config.php, extracting database config")
-            try:
-                with open(wp_config, 'r') as f:
-                    content = f.read()
-                    
-                # Extract database configuration using regex
-                import re
-                
-                db_name_match = re.search(r"define\s*\(\s*['\"]DB_NAME['\"],\s*['\"]([^'\"]+)['\"]", content)
-                if db_name_match:
-                    db_config['name'] = db_name_match.group(1)
-                    
-                db_user_match = re.search(r"define\s*\(\s*['\"]DB_USER['\"],\s*['\"]([^'\"]+)['\"]", content)
-                if db_user_match:
-                    db_config['user'] = db_user_match.group(1)
-                    
-                db_pass_match = re.search(r"define\s*\(\s*['\"]DB_PASSWORD['\"],\s*['\"]([^'\"]+)['\"]", content)
-                if db_pass_match:
-                    db_config['password'] = db_pass_match.group(1)
-                    
-                db_host_match = re.search(r"define\s*\(\s*['\"]DB_HOST['\"],\s*['\"]([^'\"]+)['\"]", content)
-                if db_host_match:
-                    db_config['host'] = db_host_match.group(1)
-                    
-            except Exception as e:
-                self.log_warning(f"Error reading wp-config.php: {e}")
-        
-        # Check for LocalSettings.php (MediaWiki)
-        mw_settings = site_path / 'public/LocalSettings.php'
-        if mw_settings.exists():
-            self.log_info("Found LocalSettings.php, extracting database config")
-            try:
-                with open(mw_settings, 'r') as f:
-                    content = f.read()
-
-                import re
-
-                server_match = re.search(r"\$wgDBserver\s*=\s*['\"]([^'\"]+)['\"]", content)
-                if server_match:
-                    server_value = server_match.group(1).strip()
-                    # If server is in host:port format, split accordingly (avoid IPv6 and socket paths)
-                    if server_value.count(':') == 1 and '/' not in server_value:
-                        host_part, port_part = server_value.rsplit(':', 1)
-                        if host_part:
-                            db_config['host'] = host_part
-                        if port_part.isdigit():
-                            db_config['port'] = port_part
-                    else:
-                        db_config['host'] = server_value
-
-                name_match = re.search(r"\$wgDBname\s*=\s*['\"]([^'\"]+)['\"]", content)
-                if name_match:
-                    db_config['name'] = name_match.group(1)
-
-                user_match = re.search(r"\$wgDBuser\s*=\s*['\"]([^'\"]+)['\"]", content)
-                if user_match:
-                    db_config['user'] = user_match.group(1)
-
-                pass_match = re.search(r"\$wgDBpassword\s*=\s*['\"]([^'\"]*)['\"]", content)
-                if pass_match:
-                    db_config['password'] = pass_match.group(1)
-
-            except Exception as e:
-                self.log_warning(f"Error reading LocalSettings.php: {e}")
-                
-        # Check for conf_global.php (Invision Power Board)
-        conf_global = site_path / 'public/conf_global.php'
-        if conf_global.exists():
-            self.log_info("Found conf_global.php, extracting database config")
-            try:
-                with open(conf_global, 'r') as f:
-                    content = f.read()
-                    
-                import re
-                
-                # Support both assignment syntax ($INFO['key'] = 'value') and array syntax ($INFO = array('key' => 'value'))
-                def first_match(patterns):
-                    for pattern in patterns:
-                        match = re.search(pattern, content)
-                        if match:
-                            return match.group(1)
-                    return None
-
-                host_value = first_match([
-                    r"\$INFO\s*\[\s*['\"]sql_host['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
-                    r"['\"]sql_host['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
-                ])
-                if host_value:
-                    # Handle optional host:port format (avoid IPv6 and socket paths)
-                    if host_value.count(':') == 1 and '/' not in host_value:
-                        host_part, port_part = host_value.rsplit(':', 1)
-                        if host_part:
-                            db_config['host'] = host_part
-                        if port_part.isdigit():
-                            db_config['port'] = port_part
-                    else:
-                        db_config['host'] = host_value
-
-                db_value = first_match([
-                    r"\$INFO\s*\[\s*['\"]sql_database['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
-                    r"['\"]sql_database['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
-                ])
-                if db_value:
-                    db_config['name'] = db_value
-
-                user_value = first_match([
-                    r"\$INFO\s*\[\s*['\"]sql_user['\"]\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
-                    r"['\"]sql_user['\"]\s*=>\s*['\"]([^'\"]+)['\"]",
-                ])
-                if user_value:
-                    db_config['user'] = user_value
-
-                pass_value = first_match([
-                    r"\$INFO\s*\[\s*['\"]sql_pass['\"]\s*\]\s*=\s*['\"]([^'\"]*)['\"]",
-                    r"['\"]sql_pass['\"]\s*=>\s*['\"]([^'\"]*)['\"]",
-                ])
-                if pass_value is not None:
-                    db_config['password'] = pass_value
-
-                # Optional explicit port key
-                port_value = first_match([
-                    r"\$INFO\s*\[\s*['\"]sql_port['\"]\s*\]\s*=\s*['\"](\d+)['\"]",
-                    r"['\"]sql_port['\"]\s*=>\s*['\"](\d+)['\"]",
-                ])
-                if port_value and port_value.isdigit():
-                    db_config['port'] = port_value
-                    
-            except Exception as e:
-                self.log_warning(f"Error reading conf_global.php: {e}")
-                
-        return db_config
-        
-    def backup_database(self, site_name: str, site_path: Path, backup_path: Path) -> bool:
-        """Create database backup"""
-        self.log_info(f"Starting database backup for {site_name}")
-        
-        # Check if mysqldump is available
-        if not shutil.which('mysqldump'):
-            self.log_warning("mysqldump not available, skipping database backup")
-            return False
-            
-        db_config = self.extract_db_config(site_path)
-        
-        if not db_config['name'] or not db_config['user']:
-            self.log_warning(f"Database configuration not found for {site_name}, skipping database backup")
-            return False
-            
-        db_backup_file = backup_path / f"{site_name}_database.sql"
-        
-        try:
-            # Use mysqldump command for better compatibility
-            cmd = [
-                'mysqldump',
-                '-h', db_config['host'],
-                '-P', db_config['port'],
-                '-u', db_config['user']
-            ]
-            
-            if db_config['password']:
-                cmd.extend(['-p' + db_config['password']])
-                
-            cmd.extend([
-                '--single-transaction',
-                '--routines',
-                '--triggers',
-                db_config['name']
-            ])
-            
-            with open(db_backup_file, 'w') as f:
-                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
-                
-            if result.returncode == 0:
-                self.log_success(f"Database backup created: {db_backup_file}")
-                return True
-            else:
-                self.log_warning(f"Failed to backup database for {site_name}: {result.stderr}")
-                db_backup_file.unlink(missing_ok=True)
-                return False
-                
-        except Exception as e:
-            self.log_warning(f"Failed to backup database for {site_name}: {e}")
-            db_backup_file.unlink(missing_ok=True)
-            return False
-            
-    def create_backup_archive(self, site_name: str, site_path: Path, temp_dir: Path, 
-                             exclude_patterns: List[str], compression_level: int) -> Path:
-        """Create backup archive"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_filename = f"{site_name}_{timestamp}.tar.gz"
-        local_backup_path = BACKUP_DIR / backup_filename
-        
-        # Create exclude file if patterns are specified
-        exclude_file = None
-        if exclude_patterns:
-            exclude_file = temp_dir / "exclude_patterns.txt"
-            with open(exclude_file, 'w') as f:
-                for pattern in exclude_patterns:
-                    f.write(f"{pattern}\n")
-                    
-        # Create tar command
-        cmd = ['tar', '-czf', str(local_backup_path)]
-        
-        if exclude_file:
-            cmd.extend(['--exclude-from', str(exclude_file)])
-            
-        # Add site directory
-        cmd.extend(['-C', str(site_path.parent), site_path.name])
-        
-        # Add temp directory contents
-        if temp_dir.exists() and any(temp_dir.iterdir()):
-            cmd.extend(['-C', str(temp_dir), '.'])
-            
-        self.log_info(f"Creating archive: {backup_filename}")
-        
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return local_backup_path
-        except subprocess.CalledProcessError as e:
-            self.log_error(f"Failed to create archive: {e}")
-            raise
-            
-    def upload_to_s3(self, local_path: Path, s3_key: str) -> bool:
-        """Upload file to S3"""
-        try:
-            self.s3_client.upload_file(str(local_path), self.s3_config['bucket'], s3_key)
-            return True
-        except Exception as e:
-            self.log_error(f"Failed to upload to S3: {e}")
-            return False
-            
-    def cleanup_old_backups(self, site_name: str, retention_days: int, success_notification: bool = True):
-        """Clean up old backups"""
-        self.log_info(f"Cleaning up old backups for {site_name} (keeping {retention_days} days)")
-        
-        try:
-            # List all backups for the site
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.s3_config['bucket'],
-                Prefix=f"{site_name}/"
-            )
-            
-            if 'Contents' not in response:
-                return
-                
-            # Filter and sort backups
-            backups = []
-            for obj in response['Contents']:
-                key = obj['Key']
-                if key.startswith(f"{site_name}/{site_name}_") and key.endswith('.tar.gz'):
-                    backups.append({
-                        'key': key,
-                        'last_modified': obj['LastModified']
-                    })
-                    
-            # Sort by date (oldest first)
-            backups.sort(key=lambda x: x['last_modified'])
-            
-            # Calculate how many to keep
-            backups_to_keep = retention_days
-            if len(backups) > backups_to_keep:
-                backups_to_delete = len(backups) - backups_to_keep
-                deleted_count = 0
-                
-                for backup in backups[:backups_to_delete]:
-                    try:
-                        self.s3_client.delete_object(
-                            Bucket=self.s3_config['bucket'],
-                            Key=backup['key']
-                        )
-                        filename = backup['key'].split('/')[-1]
-                        self.log_success(f"Deleted old backup: {filename}")
-                        if success_notification:
-                            self.send_discord_notification(
-                                "🗑️ **Old Backup Deleted**",
-                                f"Site: {site_name}\nFile: {filename}",
-                                10181046
-                            )
-                        deleted_count += 1
-                    except Exception as e:
-                        filename = backup['key'].split('/')[-1]
-                        self.log_warning(f"Failed to delete old backup {filename}: {e}")
-                        
-        except Exception as e:
-            self.log_warning(f"Error during cleanup for {site_name}: {e}")
-            
-    def backup_site(self, site_config: Dict[str, Any]) -> bool:
-        """Backup a single site"""
-        site_name = site_config['name']
-        user_path = Path(site_config['user_path'])
-        retention_days = site_config.get('retention_days', self.defaults.get('retention_days', 7))
-        backup_db = site_config.get('backup_database', self.defaults.get('backup_database', True))
-        compression_level = site_config.get('compression_level', self.defaults.get('compression_level', 6))
-        exclude_patterns = site_config.get('exclude_patterns', [])
-        # Check if we should send success notification (per-site overrides global)
-        # If not specified or explicitly null, use global setting
-        success_notification = site_config.get('success_notification')
-        if success_notification is None:
-            success_notification = self.success_notification
-        
-        self.log_info(f"Starting backup for site: {site_name}")
-        self.log_info(f"Path: {user_path}, Retention: {retention_days} days, DB: {backup_db}")
-        
-        # Check if site path exists
-        if not user_path.exists():
-            self.log_warning(f"Site path does not exist: {user_path}, skipping {site_name}")
-            self.send_discord_notification(
-                "⚠️ **Backup Warning**",
-                f"Site path not found: {user_path} for {site_name}",
-                16776960
-            )
-            return False
-            
-        # Create temporary backup directory
-        temp_dir = Path(tempfile.mkdtemp(prefix=f"backup_{site_name}_"))
-        local_backup_path = None
-        
-        try:
-            # Backup database if enabled
-            if backup_db:
-                self.backup_database(site_name, user_path, temp_dir)
-                
-            # Create backup archive
-            local_backup_path = self.create_backup_archive(
-                site_name, user_path, temp_dir, exclude_patterns, compression_level
-            )
-            
-            # Get backup size
-            backup_size = local_backup_path.stat().st_size
-            backup_size_mb = backup_size / (1024 * 1024)
-            
-            self.log_success(f"Archive created successfully: {local_backup_path.name} ({backup_size_mb:.1f} MB)")
-            
-            # Upload to S3
-            s3_key = f"{site_name}/{local_backup_path.name}"
-            self.log_info(f"Uploading to S3: {local_backup_path.name}")
-            
-            if self.upload_to_s3(local_backup_path, s3_key):
-                self.log_success(f"Upload completed: {local_backup_path.name}")
-                if success_notification:
-                    self.send_discord_notification(
-                        "✅ **Backup Successful**",
-                        f"Site: {site_name}\nSize: {backup_size_mb:.1f} MB\nFile: {local_backup_path.name}",
-                        3066993
-                    )
-                
-                # Clean up old backups
-                self.cleanup_old_backups(site_name, retention_days, success_notification)
-                
-                # Remove local backup
-                local_backup_path.unlink()
-                self.log_info(f"Local backup removed: {local_backup_path.name}")
-                return True
-            else:
-                self.log_error(f"Failed to upload backup: {local_backup_path.name}")
-                self.send_discord_notification(
-                    "❌ **Backup Failed**",
-                    f"Site: {site_name}\nReason: Failed to upload backup to S3",
-                    15158332  # Red color
-                )
-                # Clean up local backup file on failure
-                local_backup_path.unlink(missing_ok=True)
-                self.log_info(f"Local backup removed after failure: {local_backup_path.name}")
-                return False
-                
-        except Exception as e:
-            self.log_error(f"Failed to backup site {site_name}: {e}")
-            self.send_discord_notification(
-                "❌ **Backup Failed**",
-                f"Site: {site_name}\nReason: {str(e)}",
-                15158332  # Red color
-            )
-            # Clean up local backup file if it was created before the exception
-            if local_backup_path and local_backup_path.exists():
-                local_backup_path.unlink(missing_ok=True)
-                self.log_info(f"Local backup removed after exception: {local_backup_path.name}")
-            return False
+                self.restic.forget(site, self.settings['server_id'])
+            except BackupError as error:
+                logging.error('Site %s backed up, but retention failed: %s', name, error)
+                report('warning', snapshot=snapshot, database=database, error=str(error))
+                return True, False
+            logging.info('Site %s complete; snapshot %s', name, snapshot)
+            if site['success_notification']:
+                report('success', snapshot=snapshot, database=database)
+            return True, True
+        except (BackupError, OSError) as error:
+            # OSError may include paths but not credential contents.
+            message = str(error) if isinstance(error, BackupError) else 'Local filesystem operation failed'
+            logging.error('Site %s failed: %s', name, message)
+            report('error', error=message, phase=phase)
+            return False, True
         finally:
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-    def main(self):
-        """Main backup process"""
-        self.log_info("Starting backup process")
-        
-        # Check for lock file
-        self.check_lock()
-        
-        # Create backup directory
-        BACKUP_DIR.mkdir(exist_ok=True)
-        
-        # Load configuration
-        self.load_config()
-        
-        # Setup S3 client
-        self.setup_s3_client()
-        
-        # Process each site
-        site_count = len(self.sites)
-        successful_backups = 0
-        failed_backups = 0
-        
-        for site_config in self.sites:
-            if self.backup_site(site_config):
-                successful_backups += 1
-            else:
-                failed_backups += 1
-                
-        # Send summary notification (if enabled)
-        if self.summary_notification:
-            summary = f"**Backup Summary**\n"
-            summary += f"Sites processed: {site_count}\n"
-            summary += f"Successful: {successful_backups}\n"
-            summary += f"Failed: {failed_backups}"
-            
-            if failed_backups == 0:
-                self.send_discord_notification("📊 **Backup Complete**", summary, 3066993)
-            else:
-                self.send_discord_notification("⚠️ **Backup Complete with Errors**", summary, 16776960)
-        
-        if failed_backups == 0:
-            self.log_success("Backup process completed successfully")
-        else:
-            self.log_warning(f"Backup process completed with {failed_backups} failures")
-            
-        self.cleanup_and_exit(0)
-        
-def signal_handler(signum, frame):
-    """Handle interrupt signals"""
-    print("\nReceived interrupt signal, cleaning up...")
-    LOCK_FILE.unlink(missing_ok=True)
-    sys.exit(130)
-    
-if __name__ == "__main__":
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Create and run backup script
-    backup_script = BackupScript()
-    backup_script.main() 
+            if stage.is_dir() and not stage.is_symlink():
+                shutil.rmtree(stage)
+
+    def run(self, command):
+        started = time.monotonic()
+        self.lock = (self.work_dir / 'backup.lock').open('a')
+        try:
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BackupError('Another backup or maintenance job is running') from None
+            for name in ('staging', 'secrets', 'tmp', 'cache'):
+                private_directory(self.work_dir / name)
+            # A killed process can leave credentials; only our private files are removed.
+            for stale in (self.work_dir / 'secrets').glob('mysql-*.cnf'):
+                stale.unlink()
+            self.restic = Restic(self.settings['restic'], self.work_dir, self.reserve)
+            self.restic.preflight()
+            if command == 'init':
+                self.restic.run(['init', '--repository-version', '2'])
+                logging.info('Repository initialized')
+                return 0
+            # Authentication/repository failures must never implicitly initialize a repo.
+            self.restic.run(['cat', 'config'])
+            if command in ('maintenance', 'check'):
+                self.restic.maintenance(full=command == 'check')
+                logging.info('Repository maintenance completed')
+                return 0
+            results = [self.backup_site(site) for site in self.sites]
+            successful = sum(backup for backup, _ in results)
+            failures = len(results) - successful
+            maintenance_failures = sum(not retained for _, retained in results)
+            summary = (f'Sites processed: {len(results)}\nSuccessful: {successful}\n'
+                       f'Failed: {failures}\nRetention failures: {maintenance_failures}')
+            failed = failures or maintenance_failures
+            logging.info(summary.replace('\n', '; '))
+            if self.settings.get('summary_notification', True):
+                self.notify(summary_notification(self.settings['server_id'], self.sites, results,
+                                                 time.monotonic() - started))
+            return 1 if failed else 0
+        except (BackupError, OSError) as error:
+            message = str(error) if isinstance(error, BackupError) else 'Local filesystem operation failed'
+            logging.error('%s', message)
+            self.notify(job_failure(self.settings['server_id'], command, message,
+                                    time.monotonic() - started))
+            return 1
+        finally:
+            self.lock.close()  # Keep the inode: unlinking an flock file creates races.
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=SCRIPT_DIR / 'config.yaml')
+    parser.add_argument('command', nargs='?', choices=['backup', 'init', 'maintenance', 'check'], default='backup')
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    try:
+        return BackupScript(args.config.resolve()).run(args.command)
+    except (BackupError, OSError) as error:
+        logging.error('%s', error if isinstance(error, BackupError) else 'Local filesystem operation failed')
+        return 1
+    except KeyboardInterrupt:
+        logging.error('Backup job interrupted')
+        return 130
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    sys.exit(main())

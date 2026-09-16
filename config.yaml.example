@@ -1,52 +1,58 @@
-# Backup Configuration File
+# Preferred daily times for the setup wizard; saving YAML alone does not update cron.
+setup_schedule:
+  backup: "03:00"
+  maintenance: "05:00"
 
-# Global Settings
 global:
-  discord_webhook_url: "https://discord.com/api/webhooks/your-webhook-url-here"
-  success_notification: true   # Send notifications for successful backups (can be overridden per site)
-  summary_notification: true  # Send the backup summary notification at the end
-  s3:
-    endpoint: "https://your-account-id.r2.cloudflarestorage.com"
-    bucket: "your-backup-bucket"
-    access_key: "your-access-key"
-    secret_key: "your-secret-key"
-    region: "auto"
+  server_id: forge-server-1  # Keep stable; unique per server/repository.
+  discord_webhook_url: ""
+  success_notification: true
+  summary_notification: true
+  # Disk-backed directory, owned by the scheduled-job user. Do not use tmpfs.
+  work_dir: /home/forge/laravel-forge-complete-backup/.backup-work
+  min_free_mb: 1024
+  restic:
+    binary: /home/forge/laravel-forge-complete-backup/bin/restic
+    repository: s3:https://ACCOUNT.r2.cloudflarestorage.com/BUCKET/forge-server-1
+    region: auto
+    environment_file: /home/forge/laravel-forge-complete-backup/restic.env
+    password_file: /home/forge/laravel-forge-complete-backup/restic-password
+    cpu_cores: 1
+    connections: 2
+    timeout_seconds: 7200
+    check_interval_days: 7
+    check_subsets: 4  # Weekly structural check plus rotating quarter of stored data.
+    prune_interval_days: 7
+    max_repack_size: 128M
 
-# Default settings (can be overridden per site)
 defaults:
-  retention_days: 7
-  compression_level: 6
   backup_database: true
+  retention:
+    daily: 7
+    weekly: 4
+    monthly: 12
 
-# Site Configurations
 sites:
-  - name: "website1-com"
-    user_path: "/home/www-website1-com"
-    retention_days: 14
-    backup_database: true
-    compression_level: 6
-    success_notification: true  # Send success notification for this site (overrides global setting)
+  - name: website1-com
+    user_path: /home/www-website1-com
+    # Automatic discovery: .env or public/{wp-config.php,LocalSettings.php,conf_global.php}.
+    # For other layouts, select the exact file:
+    # database:
+    #   config_file: /home/www-website1-com/current/.env
+    #   timeout_seconds: 1800
+    # Or provide a private [client] option file and the database name:
+    # database:
+    #   option_file: /home/forge/.mysql-backup.cnf
+    #   name: website1
+    #   dump_binary: mariadb-dump  # Default: mysqldump
     exclude_patterns:
-      - "cache/*"
-      - "logs/*"
-      - "*.log"
-  
-  - name: "blog-website2-com"
-    user_path: "/home/blog-website2-com"
-    retention_days: 7
-    backup_database: true
-    compression_level: 9
-    exclude_patterns:
-      - "wp-content/cache/*"
-      - "wp-content/uploads/cache/*"
-  
-  - name: "app-website3-com"
-    user_path: "/home/app-website3-com"
-    retention_days: 30
+      - "*.log"  # Basename patterns match at every depth within this site.
+      - "storage/logs"  # Patterns containing / are relative to user_path.
+      - "bootstrap/cache"
+      - "node_modules"
+  - name: static-site
+    user_path: /home/static-site
     backup_database: false
-    compression_level: 3
-    success_notification: false  # Disable success notification for this site (overrides global setting)
-    exclude_patterns:
-      - "storage/logs/*"
-      - "bootstrap/cache/*"
-      - "node_modules/*"
+    success_notification: false
+    retention:
+      daily: 14
