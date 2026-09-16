@@ -7,7 +7,7 @@ No Forge API or particular Forge plan is required.
 
 ## Install on Ubuntu / Forge
 
-These steps install **v0.3.1** on a fresh Ubuntu 22.04, 24.04 or 26.04 Forge
+These steps install **v0.3.2** on a fresh Ubuntu 22.04, 24.04 or 26.04 Forge
 server using the `forge` account. For Ubuntu 20.04, see
 [Python requirements below](#prerequisites-and-ubuntu-versions) before continuing.
 For an existing v0.2.1 installation, use the [migration guide](#migration-from-v021).
@@ -37,7 +37,7 @@ configure object-expiration lifecycle rules on the backup repository prefix.
 
 ```bash
 cd /home/forge
-git clone --branch v0.3.1 https://github.com/alexmck/laravel-forge-complete-backup.git
+git clone --branch v0.3.2 https://github.com/alexmck/laravel-forge-complete-backup.git
 cd /home/forge/laravel-forge-complete-backup
 bash install.sh
 ```
@@ -50,7 +50,7 @@ If it reports a missing requirement, follow the specific remedy in
 
 Git's “detached HEAD” message is expected when checking out a release tag.
 If the directory already exists, do not delete it or clone over it. For an existing
-v0.3.1 checkout, enter that directory and rerun `bash install.sh`.
+v0.3.2 checkout, enter that directory and rerun `bash install.sh`.
 
 ![Example setup wizard detecting Laravel, WordPress and static sites](docs/images/setup-wizard.png)
 
@@ -195,7 +195,7 @@ venv/bin/python backup.py backup
 To download and decrypt a snapshot without importing a database, follow the saved
 recovery guide or [local restore instructions below](#download-decrypt-and-verify-a-backup-locally).
 
-### Update from v0.3.0 to v0.3.1
+### Update from v0.3.0 or v0.3.1 to v0.3.2
 
 On each server, as `forge`, run:
 
@@ -203,7 +203,7 @@ On each server, as `forge`, run:
 cd /home/forge/laravel-forge-complete-backup
 git status --short
 git fetch origin --tags
-git switch --detach v0.3.1
+git switch --detach v0.3.2
 ```
 
 If `git status` lists tracked files you have edited, preserve those changes before
@@ -212,7 +212,7 @@ credentials and the repository password remain in place. Existing Forge/cron job
 use the updated code automatically on their next run. This patch does not change
 Python dependencies or require rerunning setup or initializing the repository.
 
-To verify the new Discord size fields immediately, run:
+To run a backup immediately and view the Discord size fields, run:
 
 ```bash
 venv/bin/python backup.py backup
