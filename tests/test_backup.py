@@ -41,7 +41,7 @@ class Fixture(unittest.TestCase):
         for directory in ('staging', 'secrets', 'tmp', 'cache'):
             private_directory(app.work_dir / directory)
         app.restic = Mock()
-        app.restic.backup.return_value = 'a' * 64
+        app.restic.backup.return_value = {'snapshot': 'a' * 64, 'stats': {'total_bytes_processed': 3 * 1024**3, 'data_added_packed': 1024**2}}
         app.notify = Mock()
         return app
 
@@ -199,6 +199,9 @@ class OrchestrationTests(Fixture):
         app = self.app()
         app.restic.forget.side_effect = BackupError('retention failed')
         self.assertEqual(app.backup_site(app.sites[0]), (True, False))
+        fields = {f['name']: f['value'] for f in app.notify.call_args.args[0]['embeds'][0]['fields']}
+        self.assertTrue(fields['Total files processed'].startswith('3.0 GiB'))
+        self.assertTrue(fields['Data uploaded'].startswith('1.0 MiB'))
 
     def test_success_notification_override(self):
         app = self.app()
@@ -236,6 +239,30 @@ class ResticTests(Fixture):
             with self.assertRaisesRegex(BackupError, 'incomplete'):
                 backend.backup(site, self.root, 'test')
         self.assertEqual(run.call_count, 1)
+
+    def test_backup_returns_verified_snapshot_and_compressed_statistics(self):
+        for supplied, expected in (
+                ({'total_bytes_processed': 5000, 'data_added_packed': 120},
+                 {'total_bytes_processed': 5000, 'data_added_packed': 120}),
+                ({'total_bytes_processed': 5000, 'data_added_packed': 0},
+                 {'total_bytes_processed': 5000, 'data_added_packed': 0}),
+                ({'data_added': 9000}, {}),
+                ({'total_bytes_processed': -1, 'data_added_packed': True}, {})):
+            with self.subTest(supplied=supplied):
+                backend = self.backend()
+                original, completed = 'a' * 64, 'b' * 64
+                def run(args, output=None):
+                    if args[0] == 'backup':
+                        record = json.dumps({'message_type': 'summary', 'snapshot_id': original, **supplied}).encode() + b'\n'
+                        output(record[:23])
+                        output(record[23:])
+                        return b''
+                    if args[0] == 'snapshots':
+                        return json.dumps([{'id': completed, 'original': original}]).encode()
+                    return b''
+                backend.run = Mock(side_effect=run)
+                result = backend.backup(self.app().sites[0], self.root, 'test')
+                self.assertEqual(result, {'snapshot': completed, 'stats': expected})
 
     def test_retention_filters(self):
         backend = self.backend()

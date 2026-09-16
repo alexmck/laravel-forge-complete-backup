@@ -14,11 +14,14 @@ class NotificationTests(unittest.TestCase):
 
     def test_success_fields(self):
         payload = site_notification('forge-1', self.site, 'success', 83,
-                                    snapshot='a' * 64, database={'bytes': 1048576})
+                                    snapshot='a' * 64, database={'bytes': 1048576},
+                                    stats={'total_bytes_processed': 3 * 1024**3, 'data_added_packed': 2 * 1024**2})
         embed = payload['embeds'][0]
         values = {item['name']: item['value'] for item in embed['fields']}
         self.assertEqual(values['Elapsed'], '1m 23s')
-        self.assertEqual(values['Database'], 'Validated · 1.0 MiB')
+        self.assertEqual(values['Database size'], 'Validated · 1.0 MiB')
+        self.assertEqual(values['Total files processed'], '3.0 GiB\nFiles + SQL + metadata · uncompressed')
+        self.assertEqual(values['Data uploaded'], '2.0 MiB\nNew data added · compressed')
         self.assertEqual(values['Snapshot'], '`' + 'a' * 64 + '`')
         self.assertEqual(embed['color'], COLORS['success'])
         self.assertEqual(payload['allowed_mentions'], {'parse': []})
@@ -29,6 +32,22 @@ class NotificationTests(unittest.TestCase):
         embed = site_notification('forge-1', self.site, 'success', 1)['embeds'][0]
         self.assertNotIn('validated', embed['description'])
         self.assertIn('Disabled · files only', [f['value'] for f in embed['fields']])
+
+    def test_unknown_stats_are_not_reported_as_zero(self):
+        for stats in (None, {}, {'total_bytes_processed': -1, 'data_added_packed': 'bad'}):
+            embed = site_notification('forge-1', self.site, 'success', 1, stats=stats)['embeds'][0]
+            values = {f['name']: f['value'] for f in embed['fields']}
+            self.assertTrue(values['Total files processed'].startswith('Unavailable'))
+            self.assertTrue(values['Data uploaded'].startswith('Unavailable'))
+
+    def test_files_only_backup_can_upload_zero_new_data(self):
+        self.site['backup_database'] = False
+        embed = site_notification('forge-1', self.site, 'success', 1,
+                                  stats={'total_bytes_processed': 1024**3, 'data_added_packed': 0})['embeds'][0]
+        values = {f['name']: f['value'] for f in embed['fields']}
+        self.assertEqual(values['Database size'], 'Disabled · files only')
+        self.assertTrue(values['Total files processed'].startswith('1.0 GiB'))
+        self.assertTrue(values['Data uploaded'].startswith('0.0 B'))
 
     def test_retention_warning_preserves_snapshot(self):
         embed = site_notification('forge-1', self.site, 'warning', 90,
