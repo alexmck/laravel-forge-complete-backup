@@ -42,7 +42,6 @@ else
     fi
 fi
 venv/bin/python -m pip install -r requirements.txt
-chmod +x backup.py
 
 if [[ "$INSTALL_RESTIC" == true ]]; then
     if [[ ! -x bin/restic ]]; then
